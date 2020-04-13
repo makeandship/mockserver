@@ -1,43 +1,41 @@
 const fs = require('fs');
 const path = require('path');
 const colors = require('colors');
+const stableStringify = require('json-stable-stringify');
+const crypto = require('crypto');
 const join = path.join;
 const Combinatorics = require('js-combinatorics');
 const normalizeHeader = require('header-case-normalizer');
-const Monad = require('./monad');
-const importHandler = require('./handlers/importHandler');
-const headerHandler = require('./handlers/headerHandler');
-const evalHandler = require('./handlers/evalHandler');
+
 /**
  * Returns the status code out of the
  * first line of an HTTP response
  * (ie. HTTP/1.1 200 Ok)
  */
 function parseStatus(header) {
-  const regex = /(?<=HTTP\/\d.\d\s{1,1})(\d{3,3})(?=[a-z0-9\s]+)/gi;
-  if (!regex.test(header)) throw new Error('Response code should be valid string');
-
-  const res = header.match(regex);
-  return res.join('');
+  return header.split(' ')[1];
 }
 
 /**
  * Parses an HTTP header, splitting
  * by colon.
  */
-const parseHeader = function (header, context, request) {
+const parseHeader = function(header) {
   header = header.split(': ');
 
-  return { key: normalizeHeader(header[0]), value: parseValue(header[1], context, request) };
+  return { key: normalizeHeader(header[0]), value: parseValue(header[1]) };
 };
 
-const parseValue = function(value, context, request) {
-  return Monad
-    .of(value)
-    .map((value) => importHandler(value, context, request))
-    .map((value) => headerHandler(value, request))
-    .map((value) => evalHandler(value, request))
-    .join();
+const parseValue = function(value) {
+  if (/^#header/m.test(value)) {
+    return value
+      .replace(/^#header (.*);/m, function(statement, val) {
+        const expression = val.replace(/[${}]/g, '');
+        return eval(expression);
+      })
+      .replace(/\r\n?/g, '\n');
+  }
+  return value;
 };
 
 /**
@@ -55,37 +53,16 @@ const prepareWatchedHeaders = function() {
 };
 
 /**
- * Combining the identically named headers
- */
-const addHeader = function(headers, line) {
-  const { key, value } = parseHeader(line);
-
-  if (headers[key]) {
-    headers[key] = [...(Array.isArray(headers[key]) ? headers[key] : [headers[key]]), value];
-  } else {
-    headers[key] = value;
-  }
-}
-
-/**
  * Parser the content of a mockfile
  * returning an HTTP-ish object with
  * status code, headers and body.
  */
 const parse = function(content, file, request) {
-  const context = path.parse(file).dir + '/';
   const headers = {};
   let body;
   const bodyContent = [];
   content = content.split(/\r?\n/);
-  const status = Monad
-    .of(content[0])
-    .map((value) => importHandler(value, context, request))
-    .map((value) => evalHandler(value, context, request))
-    .map(parseStatus)
-    .join();
-
-
+  const status = parseStatus(content[0]);
   let headerEnd = false;
   delete content[0];
 
@@ -98,17 +75,29 @@ const parse = function(content, file, request) {
         headerEnd = true;
         break;
       default:
-        addHeader(headers, line);
+        const header = parseHeader(line);
+        headers[header.key] = header.value;
         break;
     }
   });
 
+  body = bodyContent.join('\n');
 
-  body = Monad
-    .of(bodyContent.join('\n'))
-    .map((value) => importHandler(value, context, request))
-    .map((value) => evalHandler(value, context, request))
-    .join();
+  if (/^#import/m.test(body)) {
+    const context = path.parse(file).dir + '/';
+
+    body = body
+      .replace(/^#import (.*);/m, function(includeStatement, file) {
+        const importThisFile = file.replace(/['"]/g, '');
+        const content = fs.readFileSync(path.join(context, importThisFile));
+        if (importThisFile.endsWith('.js')) {
+          return JSON.stringify(eval(content.toString()));
+        } else {
+          return content;
+        }
+      })
+      .replace(/\r\n?/g, '\n');
+  }
 
   return { status: status, headers: headers, body: body };
 };
@@ -118,7 +107,6 @@ function removeBlanks(array) {
     return i;
   });
 }
-
 
 /**
  * This method will look for a header named Response-Delay. When set it
@@ -258,6 +246,24 @@ function getBodyOrQueryString(body, query) {
   return body;
 }
 
+function getBodyAndQueryHash(body ,query = {}) {
+  if (body && body !== '') {
+    const obj = { query, body }
+    return generateHash(obj);
+  }
+
+  return body;
+}
+
+function generateHash(data) {
+  const stable = stableStringify(data);
+  const hash = crypto
+    .createHash("md5")
+    .update(stable)
+    .digest("hex");
+  return hash;
+}
+
 /**
  * Ghetto way to get the body
  * out of the request.
@@ -283,7 +289,9 @@ function getBody(req, callback) {
 }
 
 function getMockedContent(path, prefix, body, query) {
-  const mockName = prefix + (getBodyOrQueryString(body, query) || '') + '.mock';
+  const requestHash = getBodyAndQueryHash(body, query);
+  const suffix = requestHash ? `.${requestHash}` : '';
+  const mockName = prefix + suffix + '.mock';
   const mockFile = join(mockserver.directory, path, mockName);
   let content;
 
@@ -334,7 +342,7 @@ const mockserver = {
 
       const queryIndex = url.indexOf('?'),
         query =
-          queryIndex >= 0 ? url.substring(queryIndex).replace(/\?/g, '') : '',
+          queryIndex >= 0 ? url.substring(queryIndex).replace(/\?/g, '') : {},
         method = req.method.toUpperCase(),
         headers = [];
 
@@ -365,6 +373,11 @@ const mockserver = {
             return b.length - a.length;
           });
         permutations.push([]);
+      }
+
+      // check json headers
+      if (req.headers["content-type"] && req.headers["content-type"] === "application/json") {
+        body = JSON.parse(body);        
       }
 
       matched = getContentFromPermutations(
